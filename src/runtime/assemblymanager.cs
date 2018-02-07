@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
@@ -272,6 +273,7 @@ namespace Python.Runtime
             return null;
         }
 
+        static HashSet<char> invalidChars = new HashSet<char>(Path.GetInvalidFileNameChars().Concat(new List<char> { '$' }));
         /// <summary>
         /// Given a qualified name of the form A.B.C.D, attempt to load
         /// an assembly named after each of A.B.C.D, A.B.C, A.B, A. This
@@ -287,6 +289,8 @@ namespace Python.Runtime
         /// </remarks>
         public static bool LoadImplicit(string name, bool warn = true)
         {
+            if (invalidChars.Overlaps(name))
+                return false;
             string[] names = name.Split('.');
             var loaded = false;
             var s = "";
