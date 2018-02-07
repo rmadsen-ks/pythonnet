@@ -65,7 +65,7 @@ namespace Python.Runtime
         /// namespace (or null if the name is not found). This method does
         /// not increment the Python refcount of the returned object.
         /// </summary>
-        public ManagedType GetAttribute(string name, bool guess)
+        public ManagedType GetAttribute(string name, bool guess, bool canBeAssembly = true)
         {
             ManagedType cached = null;
             cache.TryGetValue(name, out cached);
@@ -122,7 +122,7 @@ namespace Python.Runtime
             // cost. Ask the AssemblyManager to do implicit loading for each
             // of the steps in the qualified name, then try it again.
             bool ignore = name.StartsWith("__");
-            if (AssemblyManager.LoadImplicit(qname, !ignore))
+            if (canBeAssembly && AssemblyManager.LoadImplicit(qname, !ignore))
             {
                 if (AssemblyManager.IsValidNamespace(qname))
                 {
@@ -192,7 +192,7 @@ namespace Python.Runtime
                 cache.TryGetValue(name, out m);
                 if (m == null)
                 {
-                    ManagedType attr = GetAttribute(name, true);
+                    ManagedType attr = GetAttribute(name, true, false);
                 }
             }
         }
@@ -273,7 +273,7 @@ namespace Python.Runtime
                 return self.dict;
             }
 
-            ManagedType attr = self.GetAttribute(name, true);
+            ManagedType attr = self.GetAttribute(name, true, false);
 
             if (attr == null)
             {

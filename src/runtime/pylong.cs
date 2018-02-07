@@ -211,7 +211,7 @@ namespace Python.Runtime
         /// </remarks>
         public short ToInt16()
         {
-            return Convert.ToInt16(ToInt64());
+            return System.Convert.ToInt16(ToInt64());
         }
 
 
@@ -223,7 +223,7 @@ namespace Python.Runtime
         /// </remarks>
         public int ToInt32()
         {
-            return Convert.ToInt32(ToInt64());
+            return System.Convert.ToInt32(ToInt64());
         }
 
 
