@@ -1,7 +1,10 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Dynamic;
+using System.Linq;
 using System.Linq.Expressions;
+using System.Reflection;
 
 namespace Python.Runtime
 {
@@ -12,7 +15,7 @@ namespace Python.Runtime
     /// PY3: https://docs.python.org/3/c-api/object.html
     /// for details.
     /// </summary>
-    public class PyObject : DynamicObject, IDisposable
+    public class PyObject : IDynamicMetaObjectProvider, IDisposable
     {
         protected internal IntPtr obj = IntPtr.Zero;
         private bool disposed = false;
@@ -291,13 +294,14 @@ namespace Python.Runtime
         /// Set an attribute of the object with the given name and value. This
         /// method throws a PythonException if the attribute set fails.
         /// </remarks>
-        public void SetAttr(string name, PyObject value)
+        public PyObject SetAttr(string name, PyObject value)
         {
             int r = Runtime.PyObject_SetAttrString(obj, name, value.obj);
             if (r < 0)
             {
                 throw new PythonException();
             }
+            return value;
         }
 
 
@@ -309,13 +313,14 @@ namespace Python.Runtime
         /// where the name is a Python string or unicode object. This method
         /// throws a PythonException if the attribute set fails.
         /// </remarks>
-        public void SetAttr(PyObject name, PyObject value)
+        public PyObject SetAttr(PyObject name, PyObject value)
         {
             int r = Runtime.PyObject_SetAttr(obj, name.obj, value.obj);
             if (r < 0)
             {
                 throw new PythonException();
             }
+            return value;
         }
 
 
@@ -922,13 +927,13 @@ namespace Python.Runtime
         }
 
 
-        public override bool TryGetMember(GetMemberBinder binder, out object result)
+        public bool TryGetMember(GetMemberBinder binder, out object result)
         {
             result = CheckNone(this.GetAttr(binder.Name));
             return true;
         }
 
-        public override bool TrySetMember(SetMemberBinder binder, object value)
+        public bool TrySetMember(SetMemberBinder binder, object value)
         {
             IntPtr ptr = Converter.ToPython(value, value?.GetType());
             int r = Runtime.PyObject_SetAttrString(obj, binder.Name, ptr);
@@ -1026,7 +1031,7 @@ namespace Python.Runtime
             return ptr;
         }
 
-        public override bool TryInvokeMember(InvokeMemberBinder binder, object[] args, out object result)
+        public bool TryInvokeMember(InvokeMemberBinder binder, object[] args, out object result)
         {
             if (this.HasAttr(binder.Name) && this.GetAttr(binder.Name).IsCallable())
             {
@@ -1052,11 +1057,12 @@ namespace Python.Runtime
             }
             else
             {
-                return base.TryInvokeMember(binder, args, out result);
+                result = null;
+                return false;
             }
         }
 
-        public override bool TryInvoke(InvokeBinder binder, object[] args, out object result)
+        public bool TryInvoke(InvokeBinder binder, object[] args, out object result)
         {
             if (this.IsCallable())
             {
@@ -1082,16 +1088,22 @@ namespace Python.Runtime
             }
             else
             {
-                return base.TryInvoke(binder, args, out result);
+                result = null;
+                return false;
             }
         }
 
-        public override bool TryConvert(ConvertBinder binder, out object result)
+        public bool TryConvert(ConvertBinder binder, out object result)
         {
             return Converter.ToManaged(this.obj, binder.Type, out result, false);
         }
 
-        public override bool TryBinaryOperation(BinaryOperationBinder binder, object arg, out object result)
+        public object Convert(Type t)
+        {
+            return this.AsManagedObject(t);
+        }
+
+        public bool TryBinaryOperation(BinaryOperationBinder binder, object arg, out object result)
         {
             IntPtr res;
             if (!(arg is PyObject))
@@ -1202,7 +1214,7 @@ namespace Python.Runtime
             return pyObj;
         }
 
-        public override bool TryUnaryOperation(UnaryOperationBinder binder, out object result)
+        public bool TryUnaryOperation(UnaryOperationBinder binder, out object result)
         {
             int r;
             IntPtr res;
@@ -1237,6 +1249,164 @@ namespace Python.Runtime
             }
             result = CheckNone(new PyObject(res));
             return true;
+        }
+        
+        public DynamicMetaObject GetMetaObject(Expression parameter)
+        {
+            return new PyMetaObject(parameter, this);
+        }
+    }
+
+    class PyMetaObject : DynamicMetaObject
+    {
+        Expression self;
+        public PyMetaObject(Expression expr, PyObject py) : base(expr, BindingRestrictions.Empty, py)
+        {
+            self = Expression.Convert(Expression, LimitType);
+        }
+        
+        static MethodInfo AttrMethod, InvokeMethod, SetAttr;
+        static MethodInfo FromManagedObject = typeof(ConverterExtension).GetMethod("ToPython");
+        static MethodInfo GetItem, SetItem;
+
+        static PyMetaObject()
+        {
+            var attrmethods = typeof(PyObject).GetMember("GetAttr").OfType<MethodInfo>();
+            foreach(var attr in attrmethods)
+            {
+                var ps = attr.GetParameters();
+                if(ps.Length == 1 && ps[0].ParameterType == typeof(string))
+                {
+                    AttrMethod = attr;
+                }
+            }
+
+            attrmethods = typeof(PyObject).GetMember("SetAttr").OfType<MethodInfo>();
+            foreach (var attr in attrmethods)
+            {
+                var ps = attr.GetParameters();
+                if (ps.Length == 2 && ps[0].ParameterType == typeof(string))
+                {
+                    SetAttr = attr;
+                }
+            }
+
+            attrmethods = typeof(PyObject).GetMember("GetItem").OfType<MethodInfo>();
+            foreach (var attr in attrmethods)
+            {
+                var ps = attr.GetParameters();
+                if (ps.Length == 1 && ps[0].ParameterType == typeof(PyObject))
+                {
+                    GetItem = attr;
+                }
+            }
+
+            attrmethods = typeof(PyObject).GetMember("SetItem").OfType<MethodInfo>();
+            foreach (var attr in attrmethods)
+            {
+                var ps = attr.GetParameters();
+                if (ps.Length == 1 && ps[0].ParameterType == typeof(PyObject))
+                {
+                    SetItem = attr;
+                }
+            }
+            
+
+            InvokeMethod = typeof(PyObject).GetMember("Invoke").OfType<MethodInfo>().FirstOrDefault(x => x.GetParameters().Any(IsParams));
+
+        }
+        static bool IsParams(ParameterInfo param)
+        {
+            return param.GetCustomAttributes(typeof(ParamArrayAttribute), false).Length > 0;
+        }
+
+
+        public override DynamicMetaObject BindInvokeMember(InvokeMemberBinder binder, DynamicMetaObject[] args)
+        {
+            var mcall = Expression.Call(self, AttrMethod, Expression.Constant(binder.Name));
+            mcall = Expression.Call(mcall, InvokeMethod, Expression.NewArrayInit(typeof(PyObject), args.Select(arg => Expression.Call(FromManagedObject, arg.Expression))));
+            return new DynamicMetaObject(mcall, this.GetRestrictions());
+        }
+
+        public override DynamicMetaObject BindInvoke(InvokeBinder binder, DynamicMetaObject[] args)
+        {
+            var expr = Expression.Call(self, InvokeMethod, Expression.NewArrayInit(typeof(PyObject), args.Select(arg => Expression.Call(FromManagedObject, arg.Expression))));
+            return new DynamicMetaObject(expr, this.GetRestrictions());
+        }
+
+        public override DynamicMetaObject BindGetMember(GetMemberBinder binder)
+        {
+            var mcall = Expression.Call(self, AttrMethod, Expression.Constant(binder.Name));
+            return new DynamicMetaObject(mcall, this.GetRestrictions());
+        }
+        public override DynamicMetaObject BindSetMember(SetMemberBinder binder, DynamicMetaObject value)
+        {
+            var mcall = Expression.Call(self, SetAttr, Expression.Constant(binder.Name), Expression.Call(FromManagedObject, Expression.Convert(value.Expression, typeof(object))));
+            return new DynamicMetaObject(mcall, this.GetRestrictions());
+        }
+        public override DynamicMetaObject BindBinaryOperation(BinaryOperationBinder binder, DynamicMetaObject arg)
+        {
+            return base.BindBinaryOperation(binder, arg);
+        }
+
+        public override DynamicMetaObject BindCreateInstance(CreateInstanceBinder binder, DynamicMetaObject[] args)
+        {
+            return base.BindCreateInstance(binder, args);
+        }
+
+        public override DynamicMetaObject BindDeleteIndex(DeleteIndexBinder binder, DynamicMetaObject[] indexes)
+        {
+            return base.BindDeleteIndex(binder, indexes);
+        }
+
+        public override DynamicMetaObject BindDeleteMember(DeleteMemberBinder binder)
+        {
+            return base.BindDeleteMember(binder);
+        }
+
+        public override DynamicMetaObject BindGetIndex(GetIndexBinder binder, DynamicMetaObject[] indexes)
+        {
+            var expr = Expression.Call(self, GetItem, Expression.Call(FromManagedObject, indexes[0].Expression));
+            return new DynamicMetaObject(expr, GetRestrictions());
+        }
+
+        public override DynamicMetaObject BindSetIndex(SetIndexBinder binder, DynamicMetaObject[] indexes, DynamicMetaObject value)
+        {
+            var expr = Expression.Call(self, SetItem, Expression.Call(FromManagedObject, indexes[0].Expression), Expression.Call(FromManagedObject, value.Expression));
+            return new DynamicMetaObject(expr, GetRestrictions());
+        }
+        public override DynamicMetaObject BindUnaryOperation(UnaryOperationBinder binder)
+        {
+            return base.BindUnaryOperation(binder);
+        }
+
+        public override IEnumerable<string> GetDynamicMemberNames()
+        {
+            return base.GetDynamicMemberNames();
+        }
+
+        public override DynamicMetaObject BindConvert(ConvertBinder binder)
+        {
+            Expression expr = Expression.Call(self, typeof(PyObject).GetMethod("Convert"), Expression.Constant(binder.Type));
+            expr = Expression.Convert(expr, binder.Type);
+            return new DynamicMetaObject(expr, GetRestrictions());
+        }
+
+        private BindingRestrictions GetRestrictions()
+        {
+            return GetTypeRestriction(this);
+        }
+
+        internal static BindingRestrictions GetTypeRestriction(DynamicMetaObject obj)
+        {
+            if (obj.Value == null && obj.HasValue)
+            {
+                return BindingRestrictions.GetInstanceRestriction(obj.Expression, null);
+            }
+            else
+            {
+                return BindingRestrictions.GetTypeRestriction(obj.Expression, obj.LimitType);
+            }
         }
     }
 }
