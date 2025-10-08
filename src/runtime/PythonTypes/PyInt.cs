@@ -9,7 +9,7 @@ namespace Python.Runtime
     /// Represents a Python integer object.
     /// See the documentation at https://docs.python.org/3/c-api/long.html
     /// </summary>
-    public class PyInt : PyNumber, IFormattable
+    public partial class PyInt : PyNumber, IFormattable
     {
         internal PyInt(in StolenReference ptr) : base(ptr)
         {
@@ -212,7 +212,7 @@ namespace Python.Runtime
                 offset++;
                 neg = true;
             }
-            byte[] littleEndianBytes = new byte[(hex.Length - offset + 1) / 2];
+            byte[] littleEndianBytes = new byte[(hex.Length - offset + 1) / 2 + 1];
             for (; offset < hex.Length; offset++)
             {
                 int littleEndianHexIndex = hex.Length - 1 - offset;

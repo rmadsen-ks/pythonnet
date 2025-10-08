@@ -33,6 +33,7 @@ namespace Python.Runtime
     {
         private static Dictionary<string, AssemblyBuilder> assemblyBuilders;
         private static Dictionary<Tuple<string, string>, ModuleBuilder> moduleBuilders;
+        private static HashSet<Type> typeHasFinalize = new();
 
         static ClassDerivedObject()
         {
@@ -144,6 +145,7 @@ namespace Python.Runtime
         /// </summary>
         internal static Type CreateDerivedType(string name,
             Type baseType,
+            IList<Type> typeInterfaces,
             BorrowedReference py_dict,
             string? namespaceStr,
             string? assemblyName,
@@ -163,7 +165,9 @@ namespace Python.Runtime
             ModuleBuilder moduleBuilder = GetModuleBuilder(assemblyName, moduleName);
 
             Type baseClass = baseType;
-            var interfaces = new List<Type> { typeof(IPythonDerivedType) };
+            var interfaces = new HashSet<Type> { typeof(IPythonDerivedType) };
+            foreach(var interfaceType in typeInterfaces)
+                interfaces.Add(interfaceType);
 
             // if the base type is an interface then use System.Object as the base class
             // and add the base type to the list of interfaces this new class will implement.
@@ -214,13 +218,17 @@ namespace Python.Runtime
                 }
             }
 
-            // override any virtual methods not already overridden by the properties above
-            MethodInfo[] methods = baseType.GetMethods();
+            // override any virtual not already overridden by the properties above
+            // also override any interface method.
+            var methods = baseType.GetMethods().Concat(interfaces.SelectMany(x => x.GetMethods()));
             var virtualMethods = new HashSet<string>();
             foreach (MethodInfo method in methods)
             {
                 if (!method.Attributes.HasFlag(MethodAttributes.Virtual) |
-                    method.Attributes.HasFlag(MethodAttributes.Final))
+                    method.Attributes.HasFlag(MethodAttributes.Final)
+                    // overriding generic virtual methods is not supported
+                    // so a call to that should be deferred to the base class method.
+                    || method.IsGenericMethod)
                 {
                     continue;
                 }
@@ -264,34 +272,43 @@ namespace Python.Runtime
                 }
             }
 
-            // add the destructor so the python object created in the constructor gets destroyed
-            MethodBuilder methodBuilder = typeBuilder.DefineMethod("Finalize",
-                MethodAttributes.Family |
-                MethodAttributes.Virtual |
-                MethodAttributes.HideBySig,
-                CallingConventions.Standard,
-                typeof(void),
-                Type.EmptyTypes);
-            ILGenerator il = methodBuilder.GetILGenerator();
-            il.Emit(OpCodes.Ldarg_0);
+
+            // only add finalizer if it has not allready been added on a base type.
+            // otherwise PyFinalize will be called multiple times for the same object,
+            // causing an access violation exception.
+            if (typeHasFinalize.Contains(baseType) == false)
+            {
+                // add the destructor so the python object created in the constructor gets destroyed
+                MethodBuilder methodBuilder = typeBuilder.DefineMethod("Finalize",
+                    MethodAttributes.Family |
+                    MethodAttributes.Virtual |
+                    MethodAttributes.HideBySig,
+                    CallingConventions.Standard,
+                    typeof(void),
+                    Type.EmptyTypes);
+                ILGenerator il = methodBuilder.GetILGenerator();
+                il.Emit(OpCodes.Ldarg_0);
 #pragma warning disable CS0618 // PythonDerivedType is for internal use only
-            il.Emit(OpCodes.Call, typeof(PythonDerivedType).GetMethod(nameof(PyFinalize)));
+                il.Emit(OpCodes.Call, typeof(PythonDerivedType).GetMethod(nameof(PyFinalize)));
 #pragma warning restore CS0618 // PythonDerivedType is for internal use only
             il.Emit(OpCodes.Ldarg_0);
             il.Emit(OpCodes.Call, baseClass.GetMethod("Finalize", BindingFlags.NonPublic | BindingFlags.Instance));
             il.Emit(OpCodes.Ret);
+                il.Emit(OpCodes.Ldarg_0);
+                il.Emit(OpCodes.Call, baseClass.GetMethod("Finalize", BindingFlags.NonPublic | BindingFlags.Instance));
+                il.Emit(OpCodes.Ret);
+            }
 
             Type type = typeBuilder.CreateType();
-
-            // scan the assembly so the newly added class can be imported
+            typeHasFinalize.Add(type);
+            // scan the assembly so the newly added class can be im ported
             Assembly assembly = Assembly.GetAssembly(type);
             AssemblyManager.ScanAssembly(assembly);
 
-            // FIXME: assemblyBuilder not used
-            AssemblyBuilder assemblyBuilder = assemblyBuilders[assemblyName];
-
             return type;
         }
+
+
 
         /// <summary>
         /// Add a constructor override that calls the python ctor after calling the base type constructor.
@@ -436,6 +453,7 @@ namespace Python.Runtime
             il.Emit(OpCodes.Ldloc_0);
 
             il.Emit(OpCodes.Ldtoken, method);
+            il.Emit(OpCodes.Ldtoken, method.DeclaringType);
 #pragma warning disable CS0618 // PythonDerivedType is for internal use only
             if (method.ReturnType == typeof(void))
             {
@@ -505,6 +523,7 @@ namespace Python.Runtime
 
             il.DeclareLocal(typeof(object[]));
             il.DeclareLocal(typeof(RuntimeMethodHandle));
+            il.DeclareLocal(typeof(RuntimeTypeHandle));
 
             // this
             il.Emit(OpCodes.Ldarg_0);
@@ -546,6 +565,11 @@ namespace Python.Runtime
             il.Emit(OpCodes.Ldloca_S, 1);
             il.Emit(OpCodes.Initobj, typeof(RuntimeMethodHandle));
             il.Emit(OpCodes.Ldloc_1);
+
+            // type handle is also not required
+            il.Emit(OpCodes.Ldloca_S, 2);
+            il.Emit(OpCodes.Initobj, typeof(RuntimeTypeHandle));
+            il.Emit(OpCodes.Ldloc_2);
 #pragma warning disable CS0618 // PythonDerivedType is for internal use only
 
             // invoke the method
@@ -698,7 +722,7 @@ namespace Python.Runtime
         /// class) it calls it, otherwise it calls the base method.
         /// </summary>
         public static T? InvokeMethod<T>(IPythonDerivedType obj, string methodName, string origMethodName,
-            object[] args, RuntimeMethodHandle methodHandle)
+            object[] args, RuntimeMethodHandle methodHandle, RuntimeTypeHandle declaringTypeHandle)
         {
             var self = GetPyObj(obj);
 
@@ -724,7 +748,10 @@ namespace Python.Runtime
                             }
 
                             PyObject py_result = method.Invoke(pyargs);
-                            PyTuple? result_tuple = MarshalByRefsBack(args, methodHandle, py_result, outsOffset: 1);
+                            var clrMethod = methodHandle != default
+                                ? MethodBase.GetMethodFromHandle(methodHandle, declaringTypeHandle)
+                                : null;
+                            PyTuple? result_tuple = MarshalByRefsBack(args, clrMethod, py_result, outsOffset: 1);
                             return result_tuple is not null
                                 ? result_tuple[0].As<T>()
                                 : py_result.As<T>();
@@ -754,7 +781,7 @@ namespace Python.Runtime
         }
 
         public static void InvokeMethodVoid(IPythonDerivedType obj, string methodName, string origMethodName,
-            object?[] args, RuntimeMethodHandle methodHandle)
+            object?[] args, RuntimeMethodHandle methodHandle, RuntimeTypeHandle declaringTypeHandle)
         {
             var self = GetPyObj(obj);
             if (null != self.Ref)
@@ -779,7 +806,10 @@ namespace Python.Runtime
                             }
 
                             PyObject py_result = method.Invoke(pyargs);
-                            MarshalByRefsBack(args, methodHandle, py_result, outsOffset: 0);
+                            var clrMethod = methodHandle != default
+                                ? MethodBase.GetMethodFromHandle(methodHandle, declaringTypeHandle)
+                                : null;
+                            MarshalByRefsBack(args, clrMethod, py_result, outsOffset: 0);
                             return;
                         }
                     }
@@ -811,12 +841,11 @@ namespace Python.Runtime
         /// as a tuple of new values for those arguments, and updates corresponding
         /// elements of <paramref name="args"/> array.
         /// </summary>
-        private static PyTuple? MarshalByRefsBack(object?[] args, RuntimeMethodHandle methodHandle, PyObject pyResult, int outsOffset)
+        private static PyTuple? MarshalByRefsBack(object?[] args, MethodBase? method, PyObject pyResult, int outsOffset)
         {
-            if (methodHandle == default) return null;
+            if (method is null) return null;
 
-            var originalMethod = MethodBase.GetMethodFromHandle(methodHandle);
-            var parameters = originalMethod.GetParameters();
+            var parameters = method.GetParameters();
             PyTuple? outs = null;
             int byrefIndex = 0;
             for (int i = 0; i < parameters.Length; ++i)

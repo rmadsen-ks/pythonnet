@@ -133,7 +133,8 @@ namespace Python.Runtime
             if (EncodableByUser(type, value))
             {
                 var encoded = PyObjectConversions.TryEncode(value, type);
-                if (encoded != null) {
+                if (encoded != null)
+                {
                     return new NewReference(encoded);
                 }
             }
@@ -334,7 +335,7 @@ namespace Python.Runtime
 
             if (obType.IsGenericType && obType.GetGenericTypeDefinition() == typeof(Nullable<>))
             {
-                if( value == Runtime.PyNone )
+                if (value == Runtime.PyNone)
                 {
                     result = null;
                     return true;
@@ -361,6 +362,29 @@ namespace Python.Runtime
             // conversions (Python string -> managed string).
             if (obType == objectType)
             {
+                if (Runtime.PyString_CheckExact(value))
+                {
+                    return ToPrimitive(value, stringType, out result, setError);
+                }
+
+                if (Runtime.PyBool_CheckExact(value))
+                {
+                    return ToPrimitive(value, boolType, out result, setError);
+                }
+
+                if (Runtime.PyFloat_CheckExact(value))
+                {
+                    return ToPrimitive(value, doubleType, out result, setError);
+                }
+
+                // give custom codecs a chance to take over conversion
+                // of ints, sequences, and types derived from primitives
+                BorrowedReference pyType = Runtime.PyObject_TYPE(value);
+                if (PyObjectConversions.TryDecode(value, pyType, obType, out result))
+                {
+                    return true;
+                }
+
                 if (Runtime.PyString_Check(value))
                 {
                     return ToPrimitive(value, stringType, out result, setError);
@@ -374,13 +398,6 @@ namespace Python.Runtime
                 if (Runtime.PyFloat_Check(value))
                 {
                     return ToPrimitive(value, doubleType, out result, setError);
-                }
-
-                // give custom codecs a chance to take over conversion of ints and sequences
-                BorrowedReference pyType = Runtime.PyObject_TYPE(value);
-                if (PyObjectConversions.TryDecode(value, pyType, obType, out result))
-                {
-                    return true;
                 }
 
                 if (Runtime.PyInt_Check(value))
@@ -670,10 +687,8 @@ namespace Python.Runtime
                         {
                             if (Runtime.PyUnicode_GetLength(value) == 1)
                             {
-                                IntPtr unicodePtr = Runtime.PyUnicode_AsUnicode(value);
-                                Char[] buff = new Char[1];
-                                Marshal.Copy(unicodePtr, buff, 0, 1);
-                                result = buff[0];
+                                int chr = Runtime.PyUnicode_ReadChar(value, 0);
+                                result = (Char)chr;
                                 return true;
                             }
                             goto type_error;
@@ -965,6 +980,12 @@ namespace Python.Runtime
         {
             if (o is null) return Runtime.None;
             return Converter.ToPython(o, o.GetType()).MoveToPyObject();
+        }
+
+        public static PyObject ToPythonAs<T>(this T? o)
+        {
+            if (o is null) return Runtime.None;
+            return Converter.ToPython(o, typeof(T)).MoveToPyObject();
         }
     }
 }

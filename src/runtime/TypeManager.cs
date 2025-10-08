@@ -374,7 +374,7 @@ namespace Python.Runtime
             return new PyTuple(bases);
         }
 
-        internal static NewReference CreateSubType(BorrowedReference py_name, BorrowedReference py_base_type, BorrowedReference dictRef)
+        internal static NewReference CreateSubType(BorrowedReference py_name, ClassBase py_base_type, IList<Type> interfaces, BorrowedReference dictRef)
         {
             // Utility to create a subtype of a managed type with the ability for the
             // a python subtype able to override the managed implementation
@@ -415,17 +415,10 @@ namespace Python.Runtime
             }
 
             // create the new managed type subclassing the base managed type
-            if (ManagedType.GetManagedObject(py_base_type) is ClassBase baseClass)
-            {
-                return ReflectedClrType.CreateSubclass(baseClass, name,
-                                                       ns: (string?)namespaceStr,
-                                                       assembly: (string?)assembly,
-                                                       dict: dictRef);
-            }
-            else
-            {
-                return Exceptions.RaiseTypeError("invalid base class, expected CLR class type");
-            }
+            return ReflectedClrType.CreateSubclass(py_base_type, interfaces, name,
+                ns: (string?)namespaceStr,
+                assembly: (string?)assembly,
+                dict: dictRef);
         }
 
         internal static IntPtr WriteMethodDef(IntPtr mdef, IntPtr name, IntPtr func, PyMethodFlags flags, IntPtr doc)
@@ -475,17 +468,20 @@ namespace Python.Runtime
             int size = Util.ReadInt32(Runtime.PyTypeType, TypeOffset.tp_basicsize)
                        + IntPtr.Size // tp_clr_inst_offset
             ;
-            var result = new PyType(new TypeSpec("clr._internal.GCOffsetBase", basicSize: size,
-                new TypeSpec.Slot[]
-                {
 
-                },
-                TypeFlags.Default | TypeFlags.HeapType | TypeFlags.HaveGC),
-                bases: new PyTuple(new[] { py_type }));
-
-            SetRequiredSlots(result, seen: new HashSet<string>());
-
-            Runtime.PyType_Modified(result);
+            var slots = new[] {
+                new TypeSpec.Slot(TypeSlotID.tp_traverse, subtype_traverse),
+                new TypeSpec.Slot(TypeSlotID.tp_clear, subtype_clear)
+            };
+            var result = new PyType(
+                new TypeSpec(
+                    "clr._internal.GCOffsetBase",
+                    basicSize: size,
+                    slots: slots,
+                    TypeFlags.Default | TypeFlags.HeapType | TypeFlags.HaveGC
+                ),
+                bases: new PyTuple(new[] { py_type })
+            );
 
             return result;
         }
@@ -616,6 +612,11 @@ namespace Python.Runtime
             Util.WriteIntPtr(type, TypeOffset.tp_name, raw);
             Util.WriteRef(type, TypeOffset.name, new NewReference(temp).Steal());
             Util.WriteRef(type, TypeOffset.qualname, temp.Steal());
+
+            // Ensure that tp_traverse and tp_clear are always set, since their
+            // existence is enforced in newer Python versions in PyType_Ready
+            Util.WriteIntPtr(type, TypeOffset.tp_traverse, subtype_traverse);
+            Util.WriteIntPtr(type, TypeOffset.tp_clear, subtype_clear);
 
             InheritSubstructs(type.Reference.DangerousGetAddress());
 
